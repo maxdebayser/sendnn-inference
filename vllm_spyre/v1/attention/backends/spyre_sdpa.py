@@ -163,6 +163,11 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         bsize = attn_metadata.padded_num_seqs
         seq_len = attn_metadata.padded_seq_len
 
+        # justspyrethings
+        query = query.transpose(0, 1).contiguous().transpose(0, 1).contiguous()
+        key = key.transpose(0, 1).contiguous().transpose(0, 1).contiguous()
+        value = value.transpose(0, 1).contiguous().transpose(0, 1).contiguous()
+
         # Reshape the query, key, and value tensors.
         query = query.view(bsize, seq_len, self.num_heads, self.head_size)
         key = key.view(bsize, seq_len, self.num_kv_heads, self.head_size)
@@ -172,9 +177,14 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         key = key.transpose(2, 1)
         value = value.transpose(2, 1)
 
-        attn_output = self._sdpa_forward(query, key, value, attn_metadata)
+        attn_out = self._sdpa_forward(query, key, value, attn_metadata)
 
-        return attn_output.view(bsize * seq_len, self.num_heads * self.head_size)
+        attn_out = attn_out.transpose(2, 1).reshape(
+            bsize * seq_len, self.num_heads * self.head_size
+        )
+        attn_out = attn_out.transpose(0, 1).contiguous().transpose(0, 1).contiguous()
+
+        return attn_out
 
     def _sdpa_forward(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_metadata
@@ -183,16 +193,10 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
         kvlen = key.shape[2]
         assert self.num_kv_heads == key.shape[1]
 
-        if self.num_kv_heads != self.num_heads:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
-
         mask_list = []
-
         idx = torch.arange(kvlen, device=key.device)
         for prompt_padding in attn_metadata.prompt_padding:
-            mask = idx >= prompt_padding
-            mask = mask.unsqueeze(0).expand(qlen, kvlen)
+            mask = torch.where(idx >= prompt_padding, 0.0, -torch.inf).repeat(qlen, 1)
             mask_list.append(mask)
 
         masks = torch.stack(mask_list)
@@ -207,7 +211,6 @@ class SpyreSDPABackendImpl(AttentionImpl[SpyreSDPAMetadata]):
             scale=self.scale,
             dropout_p=0.0,
             attn_mask=masks,
+            enable_gqa=self.num_kv_heads != self.num_heads,
         )
-
-        out = out.transpose(2, 1).contiguous()
         return out
