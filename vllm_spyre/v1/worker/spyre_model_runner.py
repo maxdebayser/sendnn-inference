@@ -5,8 +5,18 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from collections import defaultdict
 from logging import DEBUG
-from typing import TYPE_CHECKING, cast, Any, Generic, TypeVar, NamedTuple, TypeAlias, Protocol
+from typing import (
+    TYPE_CHECKING,
+    cast,
+    Any,
+    Callable,
+    Generic,
+    TypeVar,
+    NamedTuple,
+    TypeAlias,
+)
 from copy import deepcopy, copy
+from functools import partial
 
 import numpy
 import torch
@@ -45,8 +55,6 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.model_executor.models.transformers.legacy import LegacyMixin
-from vllm.model_executor.models.transformers.base import Base as TransformersBase
 
 import vllm_spyre.utils as utils_spyre
 import vllm_spyre.envs as envs_spyre
@@ -58,11 +66,6 @@ from vllm_spyre.model_executor.model_loader.spyre import (
 from vllm_spyre.platform import SpyrePlatform
 from vllm_spyre.utils import exact_div
 from vllm_spyre.v1.sample.spyre_logits_processor import build_logitsprocs_for_cb
-from vllm_spyre.compat_utils import (
-    maybe_patch_transformers_4_57,
-    is_transformers_lt_5,
-    maybe_patch_torch_2_7,
-)
 
 # yapf conflicts with ruff for this block
 # yapf: disable
@@ -101,7 +104,6 @@ class ModelForwardInputs:
 
 @dataclass(frozen=True)
 class PoolingForwardInputs(ModelForwardInputs):
-    input_masks: torch.Tensor
     token_type_ids: torch.Tensor | None
 
 
@@ -285,16 +287,6 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         return sampled_token_ids  # ty: ignore
 
 
-class PoolingModel(VllmModelForPooling, Protocol):
-    def __call__(self, *args, **kwargs) -> torch.Tensor:
-        pass
-
-    def eval(
-        self,
-    ) -> None:
-        pass
-
-
 class SpyrePoolingModelRunner(
     BaseSpyreModelRunner[PoolingInputBatch, PoolingRequestState, PoolingForwardInputs],
 ):
@@ -320,7 +312,7 @@ class SpyrePoolingModelRunner(
 
     @property
     def model(self) -> torch.nn.Module:
-        return self._model  # ty: ignore[invalid-return-type]
+        return self._model
 
     def build_input_batch(self) -> PoolingInputBatch:
         return PoolingInputBatch(
@@ -434,51 +426,48 @@ class SpyrePoolingModelRunner(
             self.attn_groups.append(create_attn_groups(attn_backends[0], i))
 
     def load_model(self) -> None:
-        maybe_patch_transformers_4_57(patch_backend=True)
-        maybe_patch_torch_2_7()
-
         model_loader = get_model_loader(self.load_config)
-        self.vllm_model: PoolingModel = model_loader.load_model(
+        self._model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
         )
-        self.vllm_model.eval()
+        self.vllm_model = cast(VllmModelForPooling, self._model)
+        self._model.eval()
         torch.set_grad_enabled(False)
 
-        def _find_compilable(module: torch.nn.Module) -> torch.nn.Module | None:
+        def _replace_compilable(
+            module: torch.nn.Module, compilation_func: Callable[[torch.nn.Module], torch.nn.Module]
+        ) -> tuple[bool, torch.nn.Module]:
             if isinstance(module, TorchCompileWithNoGuardsWrapper):
-                return module
-            for child_module in module.children():
-                if (mod := _find_compilable(child_module)) is not None:
-                    return mod
-            return None
-
-        if is_transformers_lt_5():
-            assert isinstance(self.vllm_model, TransformersBase)
-            self._model = self.vllm_model.model
-            self._compilable = self._model
-        else:
-            self._model = self.vllm_model
-            self._compilable = _find_compilable(self.model)
+                return True, compilation_func(module)
+            for name, child_module in module.named_children():
+                found, mod = _replace_compilable(child_module, compilation_func)
+                if found:
+                    setattr(module, name, mod)
+                    return found, module
+            return False, module
 
         if envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND in BACKEND_LIST:
             # Lazy import to avoid load torch_sendnn runtime before it is really
             # necessary. This solve issues of running forked tests that share
             # some resources from parent to children which can have problems
             # of caching even though the test run in isolated subprocesses.
-
             if SpyrePlatform.sendnn_configured():
                 pass
 
             with utils_spyre.stagger_region(
                 envs_spyre.VLLM_SPYRE_MAX_LOAD_PROCESSES, self.parallel_config.world_size, self.rank
             ):
-                assert self._compilable is not None
-                self._compilable.compile(
-                    mode="default",
-                    dynamic=False,
-                    backend=envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND,
-                    fullgraph=True,
+                found, self._model = _replace_compilable(
+                    self._model,
+                    partial(
+                        torch.compile,
+                        mode="default",
+                        dynamic=False,
+                        backend=envs_spyre.VLLM_SPYRE_DYNAMO_BACKEND,
+                        fullgraph=True,
+                    ),  # ty: ignore
                 )
+                assert found, "No compilable submodule found"
 
         self.use_token_type_ids = False
         if "score" in self.vllm_model.pooler.get_supported_tasks() and (
@@ -497,12 +486,11 @@ class SpyrePoolingModelRunner(
         self,
         input_ids_list: list[torch.Tensor],
         min_pad_length: int = 0,
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """left side padding implemented as
         in fms.utils.generation.pad_input_id"""
         max_len = max([min_pad_length] + [seq.size(0) for seq in input_ids_list])
         padded_input_ids_list = []
-        mask_list = []
         position_ids_list = []
         for input_ids_i in input_ids_list:
             seq_len = input_ids_i.size(0)
@@ -514,7 +502,6 @@ class SpyrePoolingModelRunner(
                 torch.ones(max_len - seq_len, dtype=torch.long, device=input_ids_i.device)
                 * self.pad_token_id
             )
-            non_pads = torch.ones(seq_len, dtype=torch.long, device=input_ids_i.device)
 
             pos_ids_seq = torch.arange(0, seq_len, dtype=torch.long, device=input_ids_i.device)
 
@@ -522,25 +509,23 @@ class SpyrePoolingModelRunner(
             # truncating the output if using truncate_after_eos once this
             # workflow works for nested tensor, this can probably be removed
             padded_input_ids_list.append(torch.cat((pads, input_ids_i)))
-            mask_list.append(torch.cat((torch.zeros_like(pads), non_pads)))
             position_ids_list.append(torch.cat((torch.zeros_like(pads), pos_ids_seq)))
 
-        return padded_input_ids_list, mask_list, position_ids_list
+        return padded_input_ids_list, position_ids_list
 
     def pad_input_ids(
         self,
         input_ids_list: list[torch.Tensor],
         min_pad_length: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        padded_input_ids_list, mask_list, position_ids_list = self._prepare_pad_input_ids(
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        padded_input_ids_list, position_ids_list = self._prepare_pad_input_ids(
             input_ids_list, min_pad_length
         )
 
         input_ids = torch.stack(padded_input_ids_list)
-        mask = torch.stack(mask_list)
         position_ids = torch.stack(position_ids_list)
 
-        return input_ids, position_ids, mask
+        return input_ids, position_ids
 
     def update_states(self, scheduler_output: SchedulerOutput):
         assert len(scheduler_output.scheduled_cached_reqs.req_ids) == 0
@@ -658,7 +643,7 @@ class SpyrePoolingModelRunner(
             )
 
         # get position ids and attention mask
-        input_tokens, position_ids, mask = self.pad_input_ids(
+        input_tokens, position_ids = self.pad_input_ids(
             input_token_list, min_pad_length=min_pad_length_batch
         )
 
@@ -666,20 +651,11 @@ class SpyrePoolingModelRunner(
         if self.use_token_type_ids:
             token_type_ids = self._token_types(input_tokens)
 
-        if (
-            is_transformers_lt_5()
-            and isinstance(self.vllm_model, LegacyMixin)
-            and self.vllm_model.is_roberta
-        ):
-            position_ids += self.pad_token_id + 1
-            position_ids *= mask
-
         model_input = PoolingForwardInputs(
             input_tokens=input_tokens,
             input_embeds=None,
             input_positions=position_ids,
             is_prompt=True,
-            input_masks=mask,
             token_type_ids=token_type_ids,
         )
 
@@ -709,9 +685,6 @@ class SpyrePoolingModelRunner(
 
         torch._dynamo.mark_static(model_input.input_tokens, 0)
         torch._dynamo.mark_static(model_input.input_tokens, 1)
-        torch._dynamo.mark_static(model_input.input_masks, 0)
-        torch._dynamo.mark_static(model_input.input_masks, 1)
-        torch._dynamo.mark_static(model_input.input_masks, 2)
         torch._dynamo.mark_static(model_input.input_positions, 0)
         torch._dynamo.mark_static(model_input.input_positions, 1)
         if self.use_token_type_ids:
@@ -793,16 +766,7 @@ class SpyrePoolingModelRunner(
         if self.use_token_type_ids:
             model_kwargs["token_type_ids"] = model_input.token_type_ids
 
-        def call_model_transformers_4_57() -> torch.Tensor:
-            outputs = self.model(
-                input_ids=model_input.input_tokens,
-                position_ids=model_input.input_positions,
-                attention_mask=model_input.input_masks,
-                **model_kwargs,
-            )
-            return outputs["last_hidden_state"]
-
-        def call_model_transformers_5() -> torch.Tensor:
+        with set_forward_context(attn_metadata, self.vllm_config):
             assert model_input.input_tokens is not None
             assert model_input.input_positions is not None
             batch, seqlen = model_input.input_tokens.shape
@@ -817,13 +781,7 @@ class SpyrePoolingModelRunner(
                 positions=model_input.input_positions.view(batch * seqlen),
                 **model_kwargs,
             )
-            return hidden_states.view(batch, seqlen, -1)
-
-        with set_forward_context(attn_metadata, self.vllm_config):
-            if is_transformers_lt_5():
-                hidden_states = call_model_transformers_4_57()
-            else:
-                hidden_states = call_model_transformers_5()
+            hidden_states = hidden_states.view(batch, seqlen, -1)
 
         # Only perform sampling in the driver worker.
         if not self.is_driver_worker:
