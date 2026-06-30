@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import vllm.envs as envs
 from huggingface_hub import hf_hub_download
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.distributed import ensure_model_parallel_initialized, init_distributed_environment
 from vllm.logger import init_logger
@@ -233,10 +233,10 @@ class SpyreWorker(WorkerBase):
         # This can probably be fixed in a nicer way.
         return 2 * accurate_fake_kv_cache_size
 
-    def initialize_from_config(self, kv_cache_configs: list[KVCacheConfig]) -> None:
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Construct the KV cache from the provided configs.
         Currently, we do not support paged attention or kv caching"""
-        pass
+        self.model_runner.initialize_kv_cache(kv_cache_config)
 
     def __init__(
         self,
@@ -407,9 +407,10 @@ class SpyreWorker(WorkerBase):
         # TODO: check additionally if the Spyre card has enough memory
         # for all requested model warmups
         # printing env variables for debugging purposes
-        load_model_start_t = time.time()
-        self.model_runner.load_model()
-        load_model_end_t = time.time()
+        with set_current_vllm_config(self.vllm_config):
+            load_model_start_t = time.time()
+            self.model_runner.load_model()
+            load_model_end_t = time.time()
 
         load_model_total_t = load_model_end_t - load_model_start_t
         self.perf_metrics.log("load model time", load_model_total_t, model=self.model_config.model)
@@ -603,7 +604,9 @@ class SpyreWorker(WorkerBase):
 
         sampling_params, pooling_params = None, None
 
-        pooling_params = PoolingParams(task="embed")  # for warmup any task will do
+        supported_tasks = self.model_runner.get_supported_tasks()
+
+        pooling_params = PoolingParams(task=supported_tasks[0])  # ty: ignore
 
         # Set up dummy requests for prefill steps
         dummy_requests = [
