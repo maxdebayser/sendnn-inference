@@ -288,13 +288,14 @@ class SpyrePlatform(Platform):
             os.environ["FLEX_OVERWRITE_NMB_FRAME"] = "false"
             os.environ["COMPILATION_MODE"] = "offline"
             if (
-                vllm_config.model_config.model_impl == "auto"
-                and vllm_config.model_config.architecture not in FMS_POOLING_MODEL_LIST
+                model_config.model_impl == "auto"
+                and model_config.architecture not in FMS_POOLING_MODEL_LIST
             ):
-                vllm_config.model_config.model_impl = "transformers"
+                model_config.model_impl = "transformers"
 
-            if vllm_config.model_config.model_impl == "transformers":
-                archs = vllm_config.model_config.hf_config.architectures
+            if model_config.model_impl == "transformers":
+                model_config.dtype = torch.float16
+                archs = model_config.hf_config.architectures
                 if archs is not None and archs[0] in (
                     "XLMRobertaForMaskedLM",
                     "RobertaForMaskedLM",
